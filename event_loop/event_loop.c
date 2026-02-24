@@ -142,8 +142,6 @@ int create_server(char* port) {
 }
 
 
-
-
 int main() {
     int listen_fd = create_server(PORT);
     int clients[FD_SETSIZE];
