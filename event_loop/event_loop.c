@@ -10,6 +10,8 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <aio.h>
+#include <errno.h>
 
 #define BUF_SIZE 1024
 #define PORT "2000"
@@ -22,6 +24,43 @@ char* get_time() {
 
     return tim_str;
 } 
+
+int async_receive(int fd, char* buf, int buf_size, struct aiocb *aiocbp) { 
+    memset(aiocbp, 0, sizeof(*aiocbp));
+
+    aiocbp->aio_buf = buf;
+    aiocbp->aio_fildes = fd;
+    aiocbp->aio_nbytes = buf_size;
+    aiocbp->aio_offset = 0;
+    aiocbp->aio_reqprio = 0;
+    aiocbp->aio_lio_opcode = 0;
+    aiocbp->aio_sigevent.sigev_notify = SIGEV_NONE;
+
+    int r = aio_read(aiocbp);
+    if (r < 0) 
+        perror("Async read error");
+    
+    return r;
+}
+
+int async_send(int fd, char* buf, int buf_size, struct aiocb *aiocbp) { 
+    
+    memset(aiocbp, 0, sizeof(*aiocbp));
+
+    aiocbp->aio_buf = buf;
+    aiocbp->aio_fildes = fd;
+    aiocbp->aio_nbytes = buf_size;
+    aiocbp->aio_offset = 0;
+    aiocbp->aio_reqprio = 0;
+    aiocbp->aio_lio_opcode = 0;
+    aiocbp->aio_sigevent.sigev_notify = SIGEV_NONE;
+
+    int w = aio_write(aiocbp);
+    if (w < 0) 
+        perror("Async write error");
+    
+    return w;
+}
 
 char* extract_filename(char* req) {
     char *end = strstr(req, "\r\n");
@@ -126,7 +165,7 @@ int create_server(char* port) {
     }
 
     if (rp == NULL) {
-        fprintf(stderr, "Could not bind\n");
+        perror("Could not bind");
         return -1;
     }
     freeaddrinfo(result);
@@ -173,32 +212,44 @@ int main() {
             if (client_fd >= 0)
                 clients[num_clients++] = client_fd;
         }
-
+        
         // existing clients
         for (int i = 0; i < num_clients; ) {
             int fd = clients[i];
             if (FD_ISSET(fd, &readfds)) {
                 char buf[BUF_SIZE];
-                ssize_t n = recv(fd, buf, BUF_SIZE - 1, 0);
-                if (n <= 0) {
+                struct aiocb aiocbp_rec; 
+                struct aiocb aiocbp_sen;
+                //ssize_t n = recv(fd, buf, BUF_SIZE - 1, 0);
+                int n = async_receive(fd, buf, sizeof(buf), &aiocbp_rec);
+
+                if (n < 0) {
                     close(fd);
                     clients[i] = clients[--num_clients];
                     continue;
                 }
 
+                while (aio_error(&aiocbp_rec) == EINPROGRESS) {
+                    ;
+                }
+
+                n = aio_return(&aiocbp_rec);
+                
                 buf[n] = '\0';
+
                 if (strstr(buf, "\r\n\r\n")) {
                     char* filename = extract_filename(buf);
                     char* filedata = read_file(filename);
                     char *resp = generate_response(filedata);
 
                     printf("Data ready to send\n");
-                    ssize_t s = send(fd, resp, strlen(resp), 0);
-                    printf("bytes sent: %ld", s);
-                    
-                    if (s < 0) {
-                        perror("Error sending data");
+                    ssize_t s = async_send(fd, resp, strlen(resp), &aiocbp_sen);
+                    while (aio_error(&aiocbp_sen) == EINPROGRESS) {
+                    ;
                     }
+
+                    printf("bytes sent: %ld\n", s);
+                    
 
                     free(resp);
                     close(fd);
@@ -209,48 +260,6 @@ int main() {
             i++;
         }
     }
-
+    close(listen_fd);
     return 0;
 }
-//    http://127.0.0.1:2000/filename/<name>
-
-// void bounce_data(int sck_fd, char* buf, int buf_size) {
-//     ssize_t nread;
-//     while ((nread = recv(sck_fd, buf, BUF_SIZE - 1, 0)) > 0) {
-//         buf[BUF_SIZE - 1] = '\0';
-
-//         printf("%s\n", buf);
-//         if (strstr(buf, "\r\n\r\n")) {
-//             break;
-//         }
-//     }
-
-//     char* res = generate_response();
-
-//     printf("date-> %s", res);
-//     send(sck_fd, res, strlen(res), 0); 
-    
-// }
-
-
-// int accept_connection(int *sck_fd, struct sockaddr *addr) {
-//     int peer_addrlen = sizeof(*addr);
-//     int acc_sck;
-//     if ((acc_sck = accept(*sck_fd, addr, &peer_addrlen)) < 0) {
-//         perror("error with accept()");
-//         return -1;
-//     }
-//     close(*sck_fd);
-//     char* ip_addr;
-    
-//     if (addr->sa_family == AF_INET) {
-//         struct sockaddr_in *sock_addr = (struct sockaddr_in*)addr;
-//         inet_ntop(AF_INET, sock_addr, ip_addr, sizeof(ip_addr));
-//     } else if (addr->sa_family == AF_INET6) {
-//         struct sockaddr_in6 *sock_addr = (struct sockaddr_in6*)addr;
-//         inet_ntop(AF_INET6, sock_addr, ip_addr, sizeof(ip_addr));
-//     }    
-
-//     printf("connection comming from: %s", ip_addr);
-//     return acc_sck;
-// }
