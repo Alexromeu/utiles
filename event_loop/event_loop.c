@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include <netdb.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,10 +13,79 @@
 #include <sys/stat.h>
 #include <aio.h>
 #include <errno.h>
+#include <signal.h>
 
 #define BUF_SIZE 1024
 #define PORT "2000"
 #define MAX_TEXT_SIZE 4096
+#define MAX_FILES 100
+
+typedef struct _File {
+    char* filename;
+    char* file_contents;
+} File;
+
+typedef struct _Cache {
+    size_t file_count;
+    File files[MAX_FILES];
+} Cache;
+
+Cache *global_cache;
+
+Cache* initialize_cache() {
+    Cache *cache = malloc(sizeof(Cache));
+    cache->file_count = 0;
+    return cache;
+}
+
+void clear_cache(Cache *cache) {
+    if (cache == NULL) return;
+    
+    if (cache->file_count > 0) {
+        for (int i = 0; i <cache->file_count; i++) {
+            free(cache->files[i].file_contents);
+            free(cache->files[i].filename);
+        }
+    }
+    cache->file_count = 0;
+    return;
+}
+
+void destroy_cache(Cache *cache) {
+    if (!cache) return;
+    clear_cache(cache);
+    free(cache);
+    printf("Cache cleared.\n");
+}
+
+void global_destroy_cache(int sig) {
+    if (!global_cache) return;
+    destroy_cache(global_cache);
+}
+
+
+void add_file_toCache(File *file, Cache *cache) {
+    if (cache->file_count >= MAX_FILES) {
+        printf("--TOO MANY FILES ON CACHE--");
+        return;
+    }
+
+    int i = cache->file_count;
+
+    cache->files[i].file_contents = strdup(file->file_contents);
+    cache->files[i].filename = strdup(file->filename);
+    cache->file_count++;
+    return;
+}
+
+void print_cache(Cache *cache) {
+    if (!cache) return;
+
+    for (int i = 0; i < cache->file_count; i++) {
+        char* n = cache->files[i].filename;
+        printf("file: %d; name: %s\n", i, n);
+    }
+}
 
 char* get_time() {
     time_t timep;
@@ -24,6 +94,18 @@ char* get_time() {
 
     return tim_str;
 } 
+
+void signal_action_clear_cache(int signum, void (*handler)(int)) {
+    struct sigaction act;
+    memset(&act, 0, sizeof(act));
+
+    act.sa_handler = handler;
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = SA_RESTART;
+
+    sigaction(signum, &act, NULL);
+}
+
 
 int async_receive(int fd, char* buf, int buf_size, struct aiocb *aiocbp) { 
     memset(aiocbp, 0, sizeof(*aiocbp));
@@ -43,6 +125,7 @@ int async_receive(int fd, char* buf, int buf_size, struct aiocb *aiocbp) {
     return r;
 }
 
+
 int async_send(int fd, char* buf, int buf_size, struct aiocb *aiocbp) { 
     
     memset(aiocbp, 0, sizeof(*aiocbp));
@@ -53,7 +136,11 @@ int async_send(int fd, char* buf, int buf_size, struct aiocb *aiocbp) {
     aiocbp->aio_offset = 0;
     aiocbp->aio_reqprio = 0;
     aiocbp->aio_lio_opcode = 0;
-    aiocbp->aio_sigevent.sigev_notify = SIGEV_NONE;
+    aiocbp->aio_sigevent.sigev_notify = SIGEV_SIGNAL;
+
+
+    
+    aiocbp->aio_sigevent.sigev_signo = SIGUSR1;
 
     int w = aio_write(aiocbp);
     if (w < 0) 
@@ -75,8 +162,10 @@ char* extract_filename(char* req) {
 
     if (strncmp(path, "/file/", 6) == 0) {
         char *name = path + 6;
+        char *name_to_return = malloc(32); 
+        strcpy(name_to_return, name);
         printf("Requested name: %s\n", name);
-        return name;
+        return name_to_return;
     }
     perror("Error extracting file name");
     return "Error extracting file name";
@@ -134,15 +223,14 @@ char* generate_response(char* body) {
 int create_server(char* port) {
     int                      sfd, s, acc_sck;
     char                     buf[BUF_SIZE];
-    socklen_t                peer_addrlen;
     struct addrinfo          hints;
     struct addrinfo          *result, *rp;
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;    /* Allow IPv4 or IPv6 */
-    hints.ai_socktype = SOCK_STREAM; /* Datagram socket */
-    hints.ai_flags = AI_PASSIVE;    /* For wildcard IP address */
-    hints.ai_protocol = 0;          /* Any protocol */
+    hints.ai_family = AF_UNSPEC;    
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;    
+    hints.ai_protocol = 0;          
     hints.ai_canonname = NULL;
     hints.ai_addr = NULL;
     hints.ai_next = NULL;
@@ -185,6 +273,7 @@ int main() {
     int listen_fd = create_server(PORT);
     int clients[FD_SETSIZE];
     int num_clients = 0;
+    Cache *cach = initialize_cache();
 
     while (1) {
         fd_set readfds;
@@ -218,10 +307,12 @@ int main() {
             int fd = clients[i];
             if (FD_ISSET(fd, &readfds)) {
                 char buf[BUF_SIZE];
-                struct aiocb aiocbp_rec; 
-                struct aiocb aiocbp_sen;
-                //ssize_t n = recv(fd, buf, BUF_SIZE - 1, 0);
-                int n = async_receive(fd, buf, sizeof(buf), &aiocbp_rec);
+                struct aiocb* aiocbp_rec = malloc(sizeof(struct aiocb)); 
+                struct aiocb* aiocbp_sen = malloc(sizeof(struct aiocb));
+                memset(aiocbp_rec, 0, sizeof(aiocbp_rec));
+                memset(aiocbp_sen, 0, sizeof(aiocbp_sen));
+               
+                int n = async_receive(fd, buf, sizeof(buf), aiocbp_rec);
 
                 if (n < 0) {
                     close(fd);
@@ -229,22 +320,29 @@ int main() {
                     continue;
                 }
 
-                while (aio_error(&aiocbp_rec) == EINPROGRESS) {
+                while (aio_error(aiocbp_rec) == EINPROGRESS) {
                     ;
                 }
 
-                n = aio_return(&aiocbp_rec);
+                n = aio_return(aiocbp_rec);
                 
                 buf[n] = '\0';
 
                 if (strstr(buf, "\r\n\r\n")) {
                     char* filename = extract_filename(buf);
                     char* filedata = read_file(filename);
-                    char *resp = generate_response(filedata);
+                    char* resp = generate_response(filedata);
 
+                    File filestr;
+                    filestr.filename = filename;
+                    filestr.file_contents = resp;
+
+                    add_file_toCache(&filestr, cach);
+                    print_cache(cach);
+                    signal_action_clear_cache(SIGUSR1, global_destroy_cache);
                     printf("Data ready to send\n");
-                    ssize_t s = async_send(fd, resp, strlen(resp), &aiocbp_sen);
-                    while (aio_error(&aiocbp_sen) == EINPROGRESS) {
+                    ssize_t s = async_send(fd, resp, strlen(resp), aiocbp_sen);
+                    while (aio_error(aiocbp_sen) == EINPROGRESS) {
                     ;
                     }
 
@@ -252,6 +350,8 @@ int main() {
                     
 
                     free(resp);
+                    free(aiocbp_rec);
+                    free(aiocbp_sen);
                     close(fd);
                     clients[i] = clients[--num_clients];
                     continue;
